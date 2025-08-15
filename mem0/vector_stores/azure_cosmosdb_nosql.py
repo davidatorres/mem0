@@ -6,16 +6,17 @@ from mem0.vector_stores.base import VectorStoreBase
 from typing import Optional
 
 try:
+    from azure.core.credentials import AzureKeyCredential
     from azure.cosmos import ContainerProxy, CosmosClient, PartitionKey, ThroughputProperties, exceptions
     from azure.identity import DefaultAzureCredential
 except ImportError:
     raise ImportError(
         "The 'azure-search-documents' library is required. Please install it using 'pip install azure-search-documents==11.5.2'."
     )
-    
+
 logger = logging.getLogger(__name__)
-    
-    
+
+
 class OutputData(BaseModel):
     id: Optional[str]
     score: Optional[float]
@@ -29,44 +30,82 @@ class AzureCosmosDbNoSql(VectorStoreBase):
         database_name: str,
         container_name: str,
         api_key: str,
+        auto_scale: bool = False,
         max_throughput: int = 400,
         vector_size: int = 1536,
-        distance: str = "cosine"
+        distance: str = "cosine",
     ) -> None:
         self.service_name = service_name
         self.container_name = container_name
         self.database_name = database_name
         self.api_key = api_key
+        self.auto_scale = auto_scale
         self.max_throughput = max_throughput
         self.vector_size = vector_size
         self.distance = distance
         self.endpoint = f"https://{self.service_name}.documents.azure.com:443/"
-        
+
         # If the API key is not provided or is a placeholder, use DefaultAzureCredential.
         if self.api_key is None or self.api_key == "" or self.api_key == "your-api-key":
             self.credential = DefaultAzureCredential()
+            self.api_key = None
         else:
             self.credential = self.api_key
 
-    def create_col(self, name, vector_size, distance):
+        self._check_database()
+        # self._create_col_if_not_exist()
+
+    def _check_database(self):
         with CosmosClient(url=self.endpoint, credential=self.credential) as client:
-            database = client.get_database_client(self.database_name)
-            
-            # Check if the database is set to autoscale by inspecting its throughput properties
-            throughput: ThroughputProperties = database.read_offer()
-            is_autoscale = False
-            if throughput and hasattr(throughput, "offer") and "autoscaleSettings" in throughput["offer"]:
-                is_autoscale = True
-            logger.info(f"Database autoscale enabled: {is_autoscale}")
-            
-            container = database.create_container_if_not_exists(
-                id=name,
-                partition_key=PartitionKey(path="/id"),
-                offer_throughput=ThroughputProperties(
-                    autoscale=is_autoscale,
-                    max_throughput=self.max_throughput,
-                )
-            )
+            databases = [db["id"] for db in client.list_databases()]
+            if self.database_name not in databases:
+                try:
+                    database = client.create_database(
+                        id=self.database_name,
+                        offer_throughput=self.max_throughput
+                    )
+                    logger.info(f"Created database: {self.database_name}")
+                    return False, 400
+                except exceptions.CosmosHttpResponseError as e:
+                    if "Shared throughput database creation is not supported for serverless accounts" in str(e):
+                        logger.warning("Creating a vector store is not supported on Cosmos DB serverless accounts")
+                        return False, -1
+            else:
+                database = client.get_database_client(self.database_name)
+                try:
+                    throughput = database.get_throughput()
+                    is_autoscale = True if throughput.auto_scale_max_throughput else False
+                    throughput_max = throughput.auto_scale_max_throughput if is_autoscale else throughput.offer_throughput
+                    logger.info(
+                        f"Database: {database.id}, Autoscale Max: {throughput.auto_scale_max_throughput}, "
+                        f"Manual Max: {throughput.offer_throughput}",
+                    )
+                    return is_autoscale, throughput_max
+                except exceptions.CosmosHttpResponseError as e:
+                    if "Reading or replacing offers is not supported for serverless accounts" in str(e):
+                        logger.warning("Creating a vector store is not supported on Cosmos DB serverless accounts")
+                        return False, -1
+                except AttributeError:
+                    logger.warning(f"Database {database.id} does not have throughput defined, throughput must be set at creation time.")
+                    return False, -1
+        
+        # Default return if no conditions are met
+        return False, -1
+
+    def _create_col_if_not_exist(self):
+        try:
+            with CosmosClient(url=self.endpoint, credential=self.credential) as client:
+                database = client.get_database_client(self.database_name)
+                try:
+                    containers = [c["id"] for c in database.list_containers()]
+                    if self.container_name not in containers:
+                        self.create_col(self.container_name, vector_size=self.vector_size, distance=self.distance)
+                except exceptions.CosmosHttpResponseError as e:
+                    logger.error(f"Failed to list containers: {e}")
+                    raise (e)
+        except exceptions.CosmosHttpResponseError as e:
+            logger.error(f"Failed to create container: {e}")
+            raise (e)
 
     def _generate_document(self, vector, payload, id):
         document = {"id": id, "vector": vector, "payload": json.dumps(payload)}
@@ -94,19 +133,35 @@ class AzureCosmosDbNoSql(VectorStoreBase):
                     results.append(None)
 
     def search(self, query, vectors, limit=5, filters=None):
-        pass
-    
+        results = []
+
+        with CosmosClient(url=self.endpoint, credential=self.credential) as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.container_name)
+            search_results = list(
+                container.query_items(
+                    query=query,
+                    max_item_count=limit,
+                    enable_cross_partition_query=True,
+                )
+            )
+            for result in search_results:
+                payload = json.loads(extract_json(result["payload"]))
+                results.append(OutputData(id=result["id"], score=0, payload=payload))
+
+        return results
+
     def delete(self, vector_id):
         with CosmosClient(url=self.endpoint, credential=self.credential) as client:
             database = client.get_database_client(self.database_name)
-            container = database.get_container_client(self.container_name)        
-        
+            container = database.get_container_client(self.container_name)
+
             try:
                 container.delete_item(item=vector_id, partition_key=vector_id)
             except exceptions.CosmosHttpResponseError as e:
                 if e.status_code == 404:
                     logger.warning(f"Document with id {vector_id} not found.")
-            
+
         return None
 
     def update(self, vector_id, vector=None, payload=None):
@@ -118,7 +173,7 @@ class AzureCosmosDbNoSql(VectorStoreBase):
             document["payload"] = json_payload
             for field in ["user_id", "run_id", "agent_id"]:
                 document[field] = payload.get(field)
-                
+
         with CosmosClient(url=self.endpoint, credential=self.credential) as client:
             database = client.get_database_client(self.database_name)
             container = database.get_container_client(self.container_name)
@@ -163,7 +218,7 @@ class AzureCosmosDbNoSql(VectorStoreBase):
         }
 
         return info
-    
+
     def list(self, filters=None, limit=None):
         results = []
 
@@ -180,119 +235,70 @@ class AzureCosmosDbNoSql(VectorStoreBase):
                     except Exception:
                         payload = document["payload"]
                     results.append(OutputData(id=document.get("id"), score=None, payload=payload))
-                
+
         return results
-    
+
     def reset(self):
         with CosmosClient(url=self.endpoint, credential=self.credential) as client:
             database = client.get_database_client(self.database_name)
             database.delete_container(self.container_name)
-        
+
         # Provide appropriate values for name, vector_size, and distance
         self.create_col(self.container_name, vector_size=self.vector_size, distance=self.distance)
-            
 
+    def create_col(self, name, vector_size=1536, distance="cosine"):
+        # Check the database first
+        is_autoscale, throughput_max = self._check_database()
+        if throughput_max == -1:
+            logger.warning(f"Database {self.database_name} does not support vector stores.")
+            return
 
+        # Define the vector embedding policy
+        vector_embedding_policy = {
+            "vectorEmbeddings": [
+                {"path": "/vector", "dataType": "float32", "distanceFunction": distance, "dimensions": vector_size}
+            ]
+        }
 
-    def create_container(
-        self,
-        container_name: str,
-        host_uri: str | None = None,
-        database_name: str | None = None,
-        indexing_policy: dict = {},
-        vector_embedding_policy: dict = {},
-        full_text_policy: dict = {},
-        offer_throughput: int = 0,
-    ) -> ContainerProxy | None:
-        """
-        Create a container if it does not exist in the specified database.
+        # Define the full-text search policy
+        full_text_policy = {"defaultLanguage": "en-US", "fullTextPaths": [{"path": "/payload", "language": "en-US"}]}
 
-        Parameters:
-            container_name (str): Name for the new container.
-            host_uri (str | None): Optional endpoint override.
-            database_name (str | None): Name of the database.
-            indexing_policy (dict): Indexing policy settings.
-            vector_embedding_policy (dict, optional): The vector embedding policy for the container. Defaults to None.
-            full_text_policy (dict, optional): The full text policy for the container. Defaults to None.
-            offer_throughput (int, optional): The throughput for the container. Defaults to 400.
+        # Define the indexing policy with both vector and full-text indexes
+        indexing_policy = {
+            "indexingMode": "consistent",
+            "automatic": True,
+            "includedPaths": [{"path": "/*"}],
+            "excludedPaths": [{"path": "/_etag/?"}, {"path": "/vector/*"}],
+            "fullTextIndexes": [{"path": "/payload"}],
+            "vectorIndexes": [
+                {"path": "/vector", "type": "diskANN", "quantizationByteSize": 96, "indexingSearchListSize": 100}
+            ],
+        }
 
-        Returns:
-            ContainerProxy | None: The created or existing container proxy.
-        """
-        host_uri = host_uri if host_uri else self.properties.host_uri
-        database_name = database_name if database_name else self.properties.database_name
+        with CosmosClient(url=self.endpoint, credential=self.credential) as client:
+            database = client.get_database_client(self.database_name)
 
-        if host_uri == self.properties.host_uri and database_name == self.properties.database_name:
-            if self.database:
-                database = self.database
+            if is_autoscale:
+                throughput_properties = ThroughputProperties(auto_scale_max_throughput=1000)
             else:
-                database = self.get_database(host_uri, database_name=database_name)
+                throughput_properties = ThroughputProperties(offer_throughput=1000)
 
-        # Create throughput property based on the offer_throughput value
-        if offer_throughput < 0:
-            # Autoscale throughput
-            if offer_throughput > -1000:  # -1 to -999
-                offer_throughput_property = ThroughputProperties(auto_scale_max_throughput=1000)
-            elif offer_throughput > -10000:  # -1000 to -9999
-                offer_throughput_property = ThroughputProperties(auto_scale_max_throughput=abs(offer_throughput))
-            else:
-                raise ValueError("Offer throughput must be between -1 and 10000. where negative values autoscale.")
-        else:
-            # Manual throughput
-            if offer_throughput < 400:  # 1 to 399
-                offer_throughput_property = ThroughputProperties(offer_throughput=400)
-            elif offer_throughput < 10001:  # 400 to 10000
-                offer_throughput_property = ThroughputProperties(offer_throughput=offer_throughput)
-            else:
-                raise ValueError("Offer throughput must be between -1 and 10000. where -1 is autoscale.")
-
-        if database:
-            return database.create_container_if_not_exists(
-                id=container_name,
-                partition_key=PartitionKey(path="/id"),
-                indexing_policy=indexing_policy,
-                vector_embedding_policy=vector_embedding_policy,
-                full_text_policy=full_text_policy,
-                offer_throughput=offer_throughput_property,
-            )
-        else:
-            self.logger.warning(f"Database with name {database_name} not found.")
-            return None
+            try:
+                container = database.create_container_if_not_exists(
+                    id=name,
+                    partition_key=PartitionKey(path="/id"),
+                    indexing_policy=indexing_policy,
+                    vector_embedding_policy=vector_embedding_policy,
+                    full_text_policy=full_text_policy,
+                    offer_throughput=throughput_properties,
+                )
+            except exceptions.CosmosHttpResponseError as e:
+                logger.error(f"Error creating container '{name}': {e}")
+                raise (e)
+            except Exception as e:
+                msg = str(e)
+                logger.error(f"Unexpected error creating container '{name}': {e}")
+                raise (e)
 
 
-
-    def query_documents(
-        self,
-        query: str,
-        host_uri: str | None = None,
-        database_name: str | None = None,
-        container_name: str | None = None,
-    ) -> list | None:
-        """
-        Execute a query on the container and return matching documents.
-
-        Parameters:
-            query (str): The SQL-like query string.
-            host_uri (str | None): Optional endpoint override.
-            database_name (str | None): Name of the database.
-            container_name (str | None): Name of the container.
-
-        Returns:
-            list | None: A list of documents that satisfy the query or None if not found.
-
-        Raises:
-            ApplicationException: If the query is missing or execution fails.
-        """
-        if query is None:
-            raise ApplicationException("Query must be provided.")
-        try:
-            container = self.get_container(host_uri, database_name, container_name)
-            if container:
-                return list(container.query_items(query=query, enable_cross_partition_query=True))
-            else:
-                self.logger.warning(f"Container with name {container_name} not found.")
-                return None
-        except Exception as e:
-            raise ApplicationException(f"Exception in query_container: {str(e)}")
-
-
+# "A Container Vector Policy has been provided, but the capability has not been enabled on your account."
